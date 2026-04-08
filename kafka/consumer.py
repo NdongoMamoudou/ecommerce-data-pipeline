@@ -50,6 +50,7 @@ def create_staging_schema(engine):
 
 
 def consume_topic(topic, table_name, engine, batch_size=100):
+    
     """
     Consomme tous les messages d'un topic Kafka et les charge
     dans PostgreSQL par batch pour optimiser les performances.
@@ -64,6 +65,7 @@ def consume_topic(topic, table_name, engine, batch_size=100):
         Au lieu d'insérer ligne par ligne (lent),
         on accumule 100 messages puis on insère d'un coup (rapide).
     """
+    
     logging.info(f"Consumer démarré sur le topic [{topic}]...")
 
     consumer = KafkaConsumer(

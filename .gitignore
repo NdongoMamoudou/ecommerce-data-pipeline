@@ -1,0 +1,30 @@
+# Variables d'environnement — contient les mots de passe
+.env
+
+# Données CSV — trop lourdes pour GitHub
+data/
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+
+# Docker volumes
+postgres_data/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
