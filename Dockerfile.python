@@ -1,0 +1,27 @@
+# =============================================================================
+# DOCKERFILE PYTHON
+# Image pour exécuter les scripts :
+#   - kafka/producer.py
+#   - kafka/consumer.py
+#   - great_expectations/validation.py
+# =============================================================================
+
+# Image de base Python 3.10
+FROM python:3.10-slim
+
+# Définir le répertoire de travail
+WORKDIR /app
+
+# Copier le fichier requirements en premier
+# Docker met en cache cette couche si requirements.txt n'a pas changé
+COPY requirements.txt .
+
+# Installer les dépendances
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copier tout le code du projet
+COPY . .
+
+# Variables d'environnement par défaut
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1

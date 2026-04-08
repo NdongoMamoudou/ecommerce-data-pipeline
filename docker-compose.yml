@@ -73,7 +73,102 @@ services:
       timeout: 10s
       retries: 5
 
-  
+
+# ==========================================
+  # PYTHON ETL
+  # Exécute les scripts :
+  # - kafka/producer.py
+  # - kafka/consumer.py
+  # - great_expectations/validation.py
+  # ==========================================
+  python-etl:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: etl_python
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./kafka:/app/kafka
+      - ./great_expectations:/app/great_expectations
+    networks:
+      - etl-network
+
+
+
+
+
+  # ==========================================
+  # AIRFLOW WEBSERVER
+  # Interface web (http://localhost:8080)
+  # ==========================================
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: etl_airflow_webserver
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow_db
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./data:/opt/airflow/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: webserver
+    networks:
+      - etl-network
+
+  # ==========================================
+  # AIRFLOW SCHEDULER
+  # Exécute les DAGs automatiquement
+  # ==========================================
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: etl_airflow_scheduler
+    restart: unless-stopped
+    depends_on:
+      - airflow-webserver
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow_db
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./data:/opt/airflow/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: scheduler
+    networks:
+      - etl-network
 
 # ==========================================
 # VOLUMES
