@@ -18,8 +18,6 @@ import os
 
 # =============================================================================
 # Configuration par défaut du DAG
-# retry_delay : attendre 5 minutes entre chaque tentative
-# retries     : réessayer 3 fois si une tâche échoue
 # =============================================================================
 default_args = {
     'owner': 'mamou_ndongo',
@@ -30,22 +28,26 @@ default_args = {
 }
 
 # =============================================================================
-# Fonctions Python — une par tâche
+# Fonctions Python
 # =============================================================================
 
 def run_producer():
     """
     Lance le producer Kafka.
-    Lit les CSV et envoie les données dans les topics Kafka.
+    Lit les CSV depuis /opt/airflow/data
+    et envoie les données dans les topics Kafka.
     """
     logging.info("Lancement du producer Kafka...")
     result = subprocess.run(
         [sys.executable, '/opt/airflow/kafka/producer.py'],
         capture_output=True,
-        text=True
+        text=True,
+        env={**os.environ,
+             'KAFKA_BROKER': os.getenv('KAFKA_BROKER', 'kafka:9092'),
+             'DATA_DIR': '/opt/airflow/data'}
     )
     if result.returncode != 0:
-        raise Exception(f"Producer échoué : {result.stderr}")
+        raise Exception(f"Producer échoué :\n{result.stderr}")
     logging.info(result.stdout)
     logging.info("Producer terminé !")
 
@@ -58,10 +60,17 @@ def run_consumer():
     result = subprocess.run(
         [sys.executable, '/opt/airflow/kafka/consumer.py'],
         capture_output=True,
-        text=True
+        text=True,
+        env={**os.environ,
+             'KAFKA_BROKER': os.getenv('KAFKA_BROKER', 'kafka:9092'),
+             'POSTGRES_HOST': os.getenv('POSTGRES_HOST', 'postgres'),
+             'POSTGRES_PORT': os.getenv('POSTGRES_PORT', '5432'),
+             'POSTGRES_USER': os.getenv('POSTGRES_USER', 'ecommerce_user'),
+             'POSTGRES_PASSWORD': os.getenv('POSTGRES_PASSWORD', 'ecommerce_password'),
+             'POSTGRES_DB': os.getenv('POSTGRES_DB', 'ecommerce_db')}
     )
     if result.returncode != 0:
-        raise Exception(f"Consumer échoué : {result.stderr}")
+        raise Exception(f"Consumer échoué :\n{result.stderr}")
     logging.info(result.stdout)
     logging.info("Consumer terminé !")
 
@@ -75,10 +84,16 @@ def run_validation():
     result = subprocess.run(
         [sys.executable, '/opt/airflow/great_expectations/validation.py'],
         capture_output=True,
-        text=True
+        text=True,
+        env={**os.environ,
+             'POSTGRES_HOST': os.getenv('POSTGRES_HOST', 'postgres'),
+             'POSTGRES_PORT': os.getenv('POSTGRES_PORT', '5432'),
+             'POSTGRES_USER': os.getenv('POSTGRES_USER', 'ecommerce_user'),
+             'POSTGRES_PASSWORD': os.getenv('POSTGRES_PASSWORD', 'ecommerce_password'),
+             'POSTGRES_DB': os.getenv('POSTGRES_DB', 'ecommerce_db')}
     )
     if result.returncode != 0:
-        raise Exception(f"Validation échouée : {result.stderr}")
+        raise Exception(f"Validation échouée :\n{result.stderr}")
     logging.info(result.stdout)
     logging.info("Validation terminée — données valides !")
 
@@ -87,7 +102,7 @@ def run_validation():
 # =============================================================================
 with DAG(
     dag_id='pipeline_ecommerce',
-    description='Pipeline e-commerce complet : Kafka → staging → validation → dbt',
+    description='Pipeline e-commerce : Kafka → staging → validation → dbt',
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
     schedule_interval='@daily',
@@ -102,10 +117,7 @@ with DAG(
     task_producer = PythonOperator(
         task_id='kafka_producer',
         python_callable=run_producer,
-        doc_md="""
-        Lance producer.py — lit les CSV Kaggle et envoie
-        chaque ligne dans les topics Kafka correspondants.
-        """
+        doc_md="Lance producer.py — envoie les CSV dans Kafka"
     )
 
     # =========================================================================
@@ -115,10 +127,7 @@ with DAG(
     task_consumer = PythonOperator(
         task_id='kafka_consumer',
         python_callable=run_consumer,
-        doc_md="""
-        Lance consumer.py — lit les messages Kafka et
-        charge les données brutes dans PostgreSQL staging.
-        """
+        doc_md="Lance consumer.py — charge Kafka dans PostgreSQL staging"
     )
 
     # =========================================================================
@@ -128,11 +137,7 @@ with DAG(
     task_validation = PythonOperator(
         task_id='great_expectations_validation',
         python_callable=run_validation,
-        doc_md="""
-        Lance validation.py — vérifie la qualité des données
-        dans staging avant transformation dbt.
-        Si des données invalides sont détectées → pipeline s'arrête.
-        """
+        doc_md="Lance validation.py — vérifie la qualité des données staging"
     )
 
     # =========================================================================
@@ -141,12 +146,8 @@ with DAG(
     # =========================================================================
     task_dbt_run = BashOperator(
         task_id='dbt_run',
-        bash_command='cd /opt/airflow/ecommerce_dbt && dbt run --profiles-dir /opt/airflow',
-        doc_md="""
-        Lance dbt run — transforme les données staging en modèles
-        marts : stg_orders, stg_customers, stg_products,
-        fact_orders, dim_customers, dim_products.
-        """
+        bash_command='cd /opt/airflow/ecommerce_dbt && dbt run --profiles-dir /opt/airflow/dbt_profiles',
+        doc_md="Lance dbt run — transforme staging en marts"
     )
 
     # =========================================================================
@@ -155,16 +156,11 @@ with DAG(
     # =========================================================================
     task_dbt_test = BashOperator(
         task_id='dbt_test',
-        bash_command='cd /opt/airflow/ecommerce_dbt && dbt test --profiles-dir /opt/airflow',
-        doc_md="""
-        Lance dbt test — vérifie la qualité des modèles dbt :
-        unique, not_null, accepted_values.
-        Si des tests échouent → pipeline s'arrête.
-        """
+        bash_command='cd /opt/airflow/ecommerce_dbt && dbt test --profiles-dir /opt/airflow/dbt_profiles',
+        doc_md="Lance dbt test — vérifie la qualité des modèles"
     )
 
     # =========================================================================
     # ORDRE D'EXECUTION
-    # producer → consumer → validation → dbt run → dbt test
     # =========================================================================
     task_producer >> task_consumer >> task_validation >> task_dbt_run >> task_dbt_test

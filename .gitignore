@@ -18,6 +18,9 @@ __pycache__/
 dbt/target/
 dbt/dbt_packages/
 dbt/logs/
+ecommerce_dbt/target/
+ecommerce_dbt/dbt_packages/
+ecommerce_dbt/logs/
 
 # Docker volumes
 postgres_data/
@@ -28,3 +31,9 @@ postgres_data/
 # IDE
 .vscode/
 .idea/
+
+# Environnement virtuel
+venv/
+
+# dbt profiles local
+dbt_profiles/

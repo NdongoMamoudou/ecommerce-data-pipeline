@@ -1,11 +1,10 @@
-version: "3.8"
-
 services:
 
   # ==========================================
   # POSTGRESQL
   # Base de données principale (staging + dwh + airflow)
   # ==========================================
+
   postgres:
     image: postgres:15
     container_name: etl_postgres
@@ -17,7 +16,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - postgres_data:/var/lib/postgresql/data  
+      - postgres_data:/var/lib/postgresql/data
       - ./init:/docker-entrypoint-initdb.d
     networks:
       - etl-network
@@ -31,6 +30,7 @@ services:
   # ZOOKEEPER
   # Gestionnaire de Kafka (obligatoire)
   # ==========================================
+
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
     container_name: etl_zookeeper
@@ -50,6 +50,7 @@ services:
   # KAFKA
   # Message broker temps réel
   # ==========================================
+
   kafka:
     image: confluentinc/cp-kafka:7.4.0
     container_name: etl_kafka
@@ -62,7 +63,7 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     networks:
@@ -73,14 +74,14 @@ services:
       timeout: 10s
       retries: 5
 
-
-# ==========================================
+  # ==========================================
   # PYTHON ETL
   # Exécute les scripts :
   # - kafka/producer.py
   # - kafka/consumer.py
   # - great_expectations/validation.py
   # ==========================================
+
   python-etl:
     build:
       context: .
@@ -101,14 +102,11 @@ services:
     networks:
       - etl-network
 
-
-
-
-
   # ==========================================
   # AIRFLOW WEBSERVER
   # Interface web (http://localhost:8080)
   # ==========================================
+
   airflow-webserver:
     build:
       context: .
@@ -130,13 +128,24 @@ services:
       _AIRFLOW_WWW_USER_CREATE: "true"
       _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
       _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+      # Variables pour que producer/consumer trouvent Kafka et PostgreSQL
+      KAFKA_BROKER: kafka:9092
+      DATA_DIR: /opt/airflow/data
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "8080:8080"
     volumes:
-      - ./dags:/opt/airflow/dags
+      - ./dags:/opt/airflow/dags                                   
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
       - ./data:/opt/airflow/data
+      - ./kafka:/opt/airflow/kafka
+      - ./great_expectations:/opt/airflow/great_expectations
+      - ./ecommerce_dbt:/opt/airflow/ecommerce_dbt                 
       - /var/run/docker.sock:/var/run/docker.sock
     command: webserver
     networks:
@@ -146,6 +155,7 @@ services:
   # AIRFLOW SCHEDULER
   # Exécute les DAGs automatiquement
   # ==========================================
+
   airflow-scheduler:
     build:
       context: .
@@ -160,11 +170,22 @@ services:
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
       AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Variables pour que producer/consumer trouvent Kafka et PostgreSQL
+      KAFKA_BROKER: kafka:9092
+      DATA_DIR: /opt/airflow/data
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - ./dags:/opt/airflow/dags
+      - ./dags:/opt/airflow/dags                                    
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
       - ./data:/opt/airflow/data
+      - ./kafka:/opt/airflow/kafka
+      - ./great_expectations:/opt/airflow/great_expectations
+      - ./ecommerce_dbt:/opt/airflow/ecommerce_dbt                  
       - /var/run/docker.sock:/var/run/docker.sock
     command: scheduler
     networks:
@@ -173,12 +194,14 @@ services:
 # ==========================================
 # VOLUMES
 # ==========================================
+
 volumes:
   postgres_data:
 
 # ==========================================
 # NETWORK
 # ==========================================
+
 networks:
   etl-network:
     driver: bridge

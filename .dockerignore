@@ -1,0 +1,33 @@
+# Environnement virtuel — jamais dans Docker
+venv/
+
+# Données CSV — montées via volumes
+data/
+
+# Logs
+*.log
+logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Variables d'environnement
+.env
+
+# Git
+.git/
+.gitignore
+
+# dbt targets
+ecommerce_dbt/target/
+ecommerce_dbt/dbt_packages/
+ecommerce_dbt/logs/
+
+# IDE
+.vscode/
+.idea/
+
+# Tests
+.pytest_cache/
