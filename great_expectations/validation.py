@@ -170,11 +170,14 @@ if __name__ == "__main__":
     # Connexion PostgreSQL
     engine = create_engine_postgres()
 
-    # Charger les tables staging
+    # Charger les tables staging avec engine.connect()
+    # SQLAlchemy 2.0 requiert une connexion explicite pour pandas
     logging.info("Chargement des données depuis staging...")
-    df_orders    = pd.read_sql("SELECT * FROM staging.raw_orders",    engine)
-    df_customers = pd.read_sql("SELECT * FROM staging.raw_customers", engine)
-    df_products  = pd.read_sql("SELECT * FROM staging.raw_products",  engine)
+
+    with engine.connect() as conn:
+        df_orders    = pd.read_sql("SELECT * FROM staging.raw_orders",    conn)
+        df_customers = pd.read_sql("SELECT * FROM staging.raw_customers", conn)
+        df_products  = pd.read_sql("SELECT * FROM staging.raw_products",  conn)
 
     logging.info(f"raw_orders    : {len(df_orders)} lignes")
     logging.info(f"raw_customers : {len(df_customers)} lignes")
