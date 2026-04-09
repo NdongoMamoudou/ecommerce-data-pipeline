@@ -22,16 +22,18 @@ logging.basicConfig(
 
 def create_engine_postgres():
     """
-    Crée une connexion SQLAlchemy vers PostgreSQL.
-    Les credentials sont lus depuis le fichier .env
-    pour ne jamais exposer les mots de passe dans le code.
+    Crée une connexion psycopg2 directe vers PostgreSQL.
+    Compatible avec toutes les versions de pandas.
     """
-    return create_engine(
-        f"postgresql+psycopg2://"
-        f"{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}"
-        f"@{os.getenv('POSTGRES_HOST')}:{os.getenv('POSTGRES_PORT')}"
-        f"/{os.getenv('POSTGRES_DB')}"
+    import psycopg2
+    conn = psycopg2.connect(
+        host=os.getenv('POSTGRES_HOST'),
+        port=os.getenv('POSTGRES_PORT'),
+        dbname=os.getenv('POSTGRES_DB'),
+        user=os.getenv('POSTGRES_USER'),
+        password=os.getenv('POSTGRES_PASSWORD')
     )
+    return conn
 
 def validate_orders(df):
     """
@@ -165,19 +167,17 @@ def print_results(result, table_name):
     logging.info(f"{'='*50}")
 
     return failed == 0
-
 if __name__ == "__main__":
-    # Connexion PostgreSQL
-    engine = create_engine_postgres()
+    # Connexion PostgreSQL via psycopg2
+    conn = create_engine_postgres()
 
-    # Charger les tables staging avec engine.connect()
-    # SQLAlchemy 2.0 requiert une connexion explicite pour pandas
+    # Charger les tables staging
     logging.info("Chargement des données depuis staging...")
+    df_orders    = pd.read_sql("SELECT * FROM staging.raw_orders",    conn)
+    df_customers = pd.read_sql("SELECT * FROM staging.raw_customers", conn)
+    df_products  = pd.read_sql("SELECT * FROM staging.raw_products",  conn)
 
-    with engine.connect() as conn:
-        df_orders    = pd.read_sql("SELECT * FROM staging.raw_orders",    conn)
-        df_customers = pd.read_sql("SELECT * FROM staging.raw_customers", conn)
-        df_products  = pd.read_sql("SELECT * FROM staging.raw_products",  conn)
+    conn.close()
 
     logging.info(f"raw_orders    : {len(df_orders)} lignes")
     logging.info(f"raw_customers : {len(df_customers)} lignes")
