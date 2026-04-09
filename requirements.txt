@@ -14,10 +14,10 @@ psycopg2-binary==2.9.9
 kafka-python==2.0.2
 
 # Data quality
-great-expectations==0.18.19
+great-expectations==0.18.21
 
 # Environment variables
 python-dotenv==1.0.1
 
-# Jupyter (développement)
-jupyter==1.1.1
+# dbt
+dbt-postgres==1.7.9

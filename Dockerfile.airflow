@@ -4,7 +4,6 @@
 # Basée sur l'image officielle Apache Airflow
 # =============================================================================
 
-# Image officielle Airflow
 FROM apache/airflow:2.8.0-python3.10
 
 # Passer en root pour installer les dépendances système
@@ -27,4 +26,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Installer les providers Airflow nécessaires
 RUN pip install --no-cache-dir \
     apache-airflow-providers-postgres \
-    apache-airflow-providers-docker
+    apache-airflow-providers-docker \
+    dbt-postgres==1.7.9
