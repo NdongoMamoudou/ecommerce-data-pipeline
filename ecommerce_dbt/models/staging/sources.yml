@@ -1,0 +1,40 @@
+version: 2
+
+sources:
+  - name: staging
+    description: "Données brutes chargées depuis Kafka dans PostgreSQL staging"
+    schema: staging
+    tables:
+      - name: raw_orders
+        description: "Commandes brutes depuis Kafka topic raw_orders"
+        columns:
+          - name: order_id
+            description: "Identifiant unique de la commande"
+          - name: customer_id
+            description: "Identifiant du client"
+          - name: order_status
+            description: "Statut de la commande"
+          - name: order_purchase_timestamp
+            description: "Date et heure d'achat"
+
+      - name: raw_customers
+        description: "Clients bruts depuis Kafka topic raw_customers"
+        columns:
+          - name: customer_id
+            description: "Identifiant unique du client"
+          - name: customer_unique_id
+            description: "Identifiant universel du client"
+          - name: customer_city
+            description: "Ville du client"
+          - name: customer_state
+            description: "Etat du client"
+
+      - name: raw_products
+        description: "Produits bruts depuis Kafka topic raw_products"
+        columns:
+          - name: product_id
+            description: "Identifiant unique du produit"
+          - name: product_category_name
+            description: "Catégorie du produit en portugais"
+          - name: product_weight_g
+            description: "Poids du produit en grammes"
