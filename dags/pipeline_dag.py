@@ -4,7 +4,11 @@
 # Schedule : tous les jours à minuit
 #
 # Flux :
-# producer.py → consumer.py → validation.py → dbt run → dbt test
+# truncate_staging → reset_topics → producer → consumer → validation → dbt run → dbt test
+#
+# Pourquoi truncate_staging en premier :
+#   Vider les tables staging avant chaque run évite les doublons
+#   si le pipeline tourne plusieurs fois dans la même journée.
 # =============================================================================
 
 from airflow import DAG
@@ -18,101 +22,273 @@ import os
 
 # =============================================================================
 # Configuration par défaut du DAG
+# Ces paramètres s'appliquent à toutes les tâches sauf si on les surcharge
 # =============================================================================
 default_args = {
     'owner': 'mamou_ndongo',
+
+    # Réessayer 3 fois si une tâche échoue
     'retries': 3,
+
+    # Attendre 5 minutes entre chaque tentative
     'retry_delay': timedelta(minutes=5),
+
+    # Pas d'email en cas d'échec (pas de serveur mail configuré)
     'email_on_failure': False,
     'email_on_retry': False,
 }
 
 # =============================================================================
-# Fonctions Python
+# Fonctions Python — une par tâche
+# Chaque fonction lance un script via subprocess pour isoler les dépendances
 # =============================================================================
+
+def run_truncate_staging():
+    """
+    Vide les tables staging avant chaque run du pipeline.
+
+    Pourquoi c'est nécessaire :
+        Sans ça, chaque run accumule les données dans staging
+        → doublons → Great Expectations échoue sur le test d'unicité
+        → le pipeline est bloqué.
+
+    On utilise psycopg2 directement pour éviter les problèmes
+    de compatibilité SQLAlchemy 2.0 avec pandas.
+    """
+    import psycopg2
+    logging.info("Vidage des tables staging avant le run...")
+
+    conn = psycopg2.connect(
+        host=os.getenv('POSTGRES_HOST', 'postgres'),
+        port=os.getenv('POSTGRES_PORT', '5432'),
+        dbname=os.getenv('POSTGRES_DB', 'ecommerce_db'),
+        user=os.getenv('POSTGRES_USER', 'ecommerce_user'),
+        password=os.getenv('POSTGRES_PASSWORD', 'ecommerce_password')
+    )
+
+    tables = [
+        'staging.raw_orders',
+        'staging.raw_customers',
+        'staging.raw_products'
+    ]
+
+    with conn.cursor() as cur:
+        for table in tables:
+            # Vérifier si la table existe avant de la vider
+            schema, table_name = table.split('.')
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = %s AND table_name = %s
+                )
+            """, (schema, table_name))
+            exists = cur.fetchone()[0]
+
+            if exists:
+                cur.execute(f"TRUNCATE TABLE {table}")
+                logging.info(f"Table {table} vidée")
+            else:
+                logging.info(f"Table {table} absente — ignorée")
+
+    conn.commit()
+    conn.close()
+    logging.info("Tables staging vidées — prêt pour un run propre !")
+
+
+def reset_kafka_topics():
+    """
+    Remet les topics Kafka à zéro avant chaque run batch.
+
+    Pourquoi c'est nécessaire :
+        Kafka conserve les messages des runs précédents.
+        Si on relit le topic depuis le début à chaque exécution,
+        on recharge aussi les anciens messages → doublons.
+
+    Stratégie :
+        1. Supprimer les topics s'ils existent
+        2. Les recréer propres et vides
+
+    Note : on utilise docker exec car Airflow est dans un container
+    et ne peut pas appeler kafka-topics directement.
+    """
+    logging.info("Réinitialisation des topics Kafka...")
+
+    topics = ["raw_orders", "raw_customers", "raw_products"]
+
+    # Supprimer les topics existants
+    for topic in topics:
+        logging.info(f"Suppression du topic : {topic}")
+        subprocess.run(
+            [
+                "docker", "exec", "etl_kafka",
+                "kafka-topics",
+                "--bootstrap-server", "localhost:9092",
+                "--delete",
+                "--topic", topic
+            ],
+            capture_output=True,
+            text=True,
+            check=False  # Ne pas lever d'erreur si le topic n'existe pas
+        )
+
+    # Attendre que Kafka supprime les topics
+    import time
+    time.sleep(5)
+
+    # Recréer les topics propres
+    for topic in topics:
+        logging.info(f"Création du topic : {topic}")
+        result = subprocess.run(
+            [
+                "docker", "exec", "etl_kafka",
+                "kafka-topics",
+                "--bootstrap-server", "localhost:9092",
+                "--create",
+                "--if-not-exists",
+                "--topic", topic,
+                "--partitions", "1",
+                "--replication-factor", "1"
+            ],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            raise Exception(f"Échec création topic {topic} :\n{result.stderr}")
+
+    logging.info("Topics Kafka réinitialisés avec succès !")
+
 
 def run_producer():
     """
     Lance le producer Kafka.
     Lit les CSV depuis /opt/airflow/data
-    et envoie les données dans les topics Kafka.
+    et envoie chaque ligne dans les topics Kafka correspondants.
+
+    On passe les variables d'environnement explicitement pour que
+    le script trouve bien Kafka même depuis le container Airflow.
     """
     logging.info("Lancement du producer Kafka...")
     result = subprocess.run(
         [sys.executable, '/opt/airflow/kafka/producer.py'],
         capture_output=True,
         text=True,
-        env={**os.environ,
-             'KAFKA_BROKER': os.getenv('KAFKA_BROKER', 'kafka:9092'),
-             'DATA_DIR': '/opt/airflow/data'}
+        env={
+            **os.environ,
+            'KAFKA_BROKER': os.getenv('KAFKA_BROKER', 'kafka:9092'),
+            'DATA_DIR': '/opt/airflow/data'
+        }
     )
     if result.returncode != 0:
         raise Exception(f"Producer échoué :\n{result.stderr}")
     logging.info(result.stdout)
     logging.info("Producer terminé !")
 
+
 def run_consumer():
     """
     Lance le consumer Kafka.
-    Lit les messages Kafka et charge dans PostgreSQL staging.
+    Lit les messages depuis les topics Kafka
+    et les charge dans PostgreSQL schéma staging.
+
+    Le consumer utilise un group_id dynamique (basé sur timestamp)
+    pour relire tout le topic à chaque run — pas d'offset mémorisé.
     """
     logging.info("Lancement du consumer Kafka...")
     result = subprocess.run(
         [sys.executable, '/opt/airflow/kafka/consumer.py'],
         capture_output=True,
         text=True,
-        env={**os.environ,
-             'KAFKA_BROKER': os.getenv('KAFKA_BROKER', 'kafka:9092'),
-             'POSTGRES_HOST': os.getenv('POSTGRES_HOST', 'postgres'),
-             'POSTGRES_PORT': os.getenv('POSTGRES_PORT', '5432'),
-             'POSTGRES_USER': os.getenv('POSTGRES_USER', 'ecommerce_user'),
-             'POSTGRES_PASSWORD': os.getenv('POSTGRES_PASSWORD', 'ecommerce_password'),
-             'POSTGRES_DB': os.getenv('POSTGRES_DB', 'ecommerce_db')}
+        env={
+            **os.environ,
+            'KAFKA_BROKER': os.getenv('KAFKA_BROKER', 'kafka:9092'),
+            'POSTGRES_HOST': os.getenv('POSTGRES_HOST', 'postgres'),
+            'POSTGRES_PORT': os.getenv('POSTGRES_PORT', '5432'),
+            'POSTGRES_USER': os.getenv('POSTGRES_USER', 'ecommerce_user'),
+            'POSTGRES_PASSWORD': os.getenv('POSTGRES_PASSWORD', 'ecommerce_password'),
+            'POSTGRES_DB': os.getenv('POSTGRES_DB', 'ecommerce_db')
+        }
     )
     if result.returncode != 0:
         raise Exception(f"Consumer échoué :\n{result.stderr}")
     logging.info(result.stdout)
     logging.info("Consumer terminé !")
 
+
 def run_validation():
     """
     Lance Great Expectations.
-    Vérifie la qualité des données dans staging.
-    Si la validation échoue → le pipeline s'arrête.
+    Vérifie la qualité des données dans staging avant transformation dbt.
+
+    Tests effectués :
+        - raw_orders    : order_id unique, not null, status valide
+        - raw_customers : customer_id unique, not null, state not null
+        - raw_products  : product_id unique, not null, weight entre 0 et 50000
+
+    Si une règle échoue → exit(1) → Airflow marque FAILED
+    → dbt ne se lance pas → données corrompues bloquées ici.
     """
     logging.info("Lancement de la validation Great Expectations...")
     result = subprocess.run(
         [sys.executable, '/opt/airflow/great_expectations/validation.py'],
         capture_output=True,
         text=True,
-        env={**os.environ,
-             'POSTGRES_HOST': os.getenv('POSTGRES_HOST', 'postgres'),
-             'POSTGRES_PORT': os.getenv('POSTGRES_PORT', '5432'),
-             'POSTGRES_USER': os.getenv('POSTGRES_USER', 'ecommerce_user'),
-             'POSTGRES_PASSWORD': os.getenv('POSTGRES_PASSWORD', 'ecommerce_password'),
-             'POSTGRES_DB': os.getenv('POSTGRES_DB', 'ecommerce_db')}
+        env={
+            **os.environ,
+            'POSTGRES_HOST': os.getenv('POSTGRES_HOST', 'postgres'),
+            'POSTGRES_PORT': os.getenv('POSTGRES_PORT', '5432'),
+            'POSTGRES_USER': os.getenv('POSTGRES_USER', 'ecommerce_user'),
+            'POSTGRES_PASSWORD': os.getenv('POSTGRES_PASSWORD', 'ecommerce_password'),
+            'POSTGRES_DB': os.getenv('POSTGRES_DB', 'ecommerce_db')
+        }
     )
     if result.returncode != 0:
         raise Exception(f"Validation échouée :\n{result.stderr}")
     logging.info(result.stdout)
     logging.info("Validation terminée — données valides !")
 
+
 # =============================================================================
 # Définition du DAG
 # =============================================================================
 with DAG(
     dag_id='pipeline_ecommerce',
-    description='Pipeline e-commerce : Kafka → staging → validation → dbt',
+    description='Pipeline e-commerce : truncate → Kafka → staging → validation → dbt',
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
+
+    # Lancer automatiquement tous les jours à minuit
     schedule_interval='@daily',
+
+    # Ne pas rattraper les runs passés depuis start_date
     catchup=False,
+
     tags=['ecommerce', 'kafka', 'dbt', 'data-engineering']
 ) as dag:
 
     # =========================================================================
-    # TACHE 1 — Producer Kafka
-    # Lit les CSV et envoie dans Kafka
+    # TACHE 1 — Truncate staging
+    # Vide les tables staging pour éviter les doublons
+    # =========================================================================
+    task_truncate = PythonOperator(
+        task_id='truncate_staging',
+        python_callable=run_truncate_staging,
+        doc_md="Vide les tables staging avant le run pour éviter les doublons"
+    )
+
+    # =========================================================================
+    # TACHE 2 — Reset topics Kafka
+    # Supprime et recrée les topics pour repartir sur un run propre
+    # =========================================================================
+    task_reset_topics = PythonOperator(
+        task_id='reset_kafka_topics',
+        python_callable=reset_kafka_topics,
+        doc_md="Supprime et recrée les topics Kafka pour éviter les doublons"
+    )
+
+    # =========================================================================
+    # TACHE 3 — Producer Kafka
+    # Lit les CSV Kaggle et envoie chaque ligne dans Kafka
     # =========================================================================
     task_producer = PythonOperator(
         task_id='kafka_producer',
@@ -121,8 +297,8 @@ with DAG(
     )
 
     # =========================================================================
-    # TACHE 2 — Consumer Kafka
-    # Lit Kafka et charge dans PostgreSQL staging
+    # TACHE 4 — Consumer Kafka
+    # Lit les messages Kafka et charge dans PostgreSQL staging
     # =========================================================================
     task_consumer = PythonOperator(
         task_id='kafka_consumer',
@@ -131,8 +307,9 @@ with DAG(
     )
 
     # =========================================================================
-    # TACHE 3 — Validation Great Expectations
-    # Vérifie la qualité des données dans staging
+    # TACHE 5 — Validation Great Expectations
+    # Vérifie la qualité des données staging avant dbt
+    # Si échec → pipeline bloqué ici, dbt ne tourne pas
     # =========================================================================
     task_validation = PythonOperator(
         task_id='great_expectations_validation',
@@ -141,26 +318,32 @@ with DAG(
     )
 
     # =========================================================================
-    # TACHE 4 — dbt run
-    # Transforme les données staging en marts
+    # TACHE 6 — dbt run
+    # Transforme les données brutes staging en modèles propres dans marts
+    # stg_orders, stg_customers, stg_products → fact_orders, dim_customers, dim_products
+    #
+    # --profiles-dir pointe vers le dossier contenant profiles.yml
     # =========================================================================
     task_dbt_run = BashOperator(
         task_id='dbt_run',
-        bash_command='cd /opt/airflow/ecommerce_dbt && dbt run --profiles-dir /opt/airflow/dbt_profiles',
+        bash_command='cd /opt/airflow/ecommerce_dbt && dbt run --profiles-dir /opt/airflow/ecommerce_dbt',
         doc_md="Lance dbt run — transforme staging en marts"
     )
 
     # =========================================================================
-    # TACHE 5 — dbt test
-    # Vérifie la qualité des modèles dbt
+    # TACHE 7 — dbt test
+    # Vérifie la qualité des modèles dbt après transformation
+    # Tests : unique, not_null, accepted_values
     # =========================================================================
     task_dbt_test = BashOperator(
         task_id='dbt_test',
-        bash_command='cd /opt/airflow/ecommerce_dbt && dbt test --profiles-dir /opt/airflow/dbt_profiles',
+        bash_command='cd /opt/airflow/ecommerce_dbt && dbt test --profiles-dir /opt/airflow/ecommerce_dbt',
         doc_md="Lance dbt test — vérifie la qualité des modèles"
     )
 
     # =========================================================================
     # ORDRE D'EXECUTION
+    # >> signifie "cette tâche doit finir avant de lancer la suivante"
+    # truncate → reset topics → producer → consumer → validation → dbt run → dbt test
     # =========================================================================
-    task_producer >> task_consumer >> task_validation >> task_dbt_run >> task_dbt_test
+    task_truncate >> task_reset_topics >> task_producer >> task_consumer >> task_validation >> task_dbt_run >> task_dbt_test
