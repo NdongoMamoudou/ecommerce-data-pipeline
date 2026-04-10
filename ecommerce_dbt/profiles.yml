@@ -1,0 +1,15 @@
+# profiles.yml — configuration de connexion dbt vers PostgreSQL
+# Ce fichier doit être dans le même dossier que dbt_project.yml
+
+ecommerce_dbt:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: postgres        # nom du service Docker
+      port: 5432
+      dbname: ecommerce_db
+      user: ecommerce_user
+      password: ecommerce_password
+      schema: dwh           # dbt crée ses modèles dans le schéma dwh
+      threads: 4

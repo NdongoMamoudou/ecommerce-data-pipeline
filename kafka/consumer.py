@@ -7,6 +7,7 @@
 import json
 import logging
 import os
+import time
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
@@ -21,11 +22,12 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+
 def create_engine_postgres():
     """
     Crée une connexion SQLAlchemy vers PostgreSQL.
-    Utilisée uniquement pour créer le schéma staging.
-    Les credentials sont lus depuis .env — jamais en dur dans le code.
+    Utilisée uniquement pour exécuter des requêtes SQL (ex: TRUNCATE).
+    Les schémas sont déjà créés via init.sql au démarrage Docker.
     """
     logging.info("Connexion à PostgreSQL via SQLAlchemy...")
     return create_engine(
@@ -34,6 +36,7 @@ def create_engine_postgres():
         f"@{os.getenv('POSTGRES_HOST')}:{os.getenv('POSTGRES_PORT')}"
         f"/{os.getenv('POSTGRES_DB')}"
     )
+
 
 def create_pg_connection():
     """
@@ -49,15 +52,6 @@ def create_pg_connection():
         password=os.getenv('POSTGRES_PASSWORD')
     )
 
-def create_staging_schema(engine):
-    """
-    Crée le schéma 'staging' dans PostgreSQL s'il n'existe pas.
-    C'est ici que les données brutes sont stockées
-    avant transformation par dbt.
-    """
-    with engine.begin() as conn:
-        conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging"))
-    logging.info("Schéma staging prêt !")
 
 def create_table_if_not_exists(pg_conn, table_name, columns):
     """
@@ -75,20 +69,108 @@ def create_table_if_not_exists(pg_conn, table_name, columns):
         cur.execute(query)
     pg_conn.commit()
 
+
+def create_staging_tables(pg_conn):
+    """
+    Crée les tables staging minimales si elles n'existent pas encore.
+
+    Pourquoi c'est nécessaire :
+        Dans ce pipeline, une table était créée seulement au moment
+        du premier insert. Donc si un topic Kafka ne renvoyait aucun
+        message pendant un run, la table n'était jamais créée,
+        même si le consumer se terminait avec succès.
+
+    Cette fonction garantit que les 3 tables existent dès le départ,
+    même si un topic est vide au moment du run.
+    """
+    tables = {
+        "raw_orders": [
+            "order_id",
+            "customer_id",
+            "order_status",
+            "order_purchase_timestamp",
+            "order_approved_at",
+            "order_delivered_carrier_date",
+            "order_delivered_customer_date",
+            "order_estimated_delivery_date"
+        ],
+        "raw_customers": [
+            "customer_id",
+            "customer_unique_id",
+            "customer_zip_code_prefix",
+            "customer_city",
+            "customer_state"
+        ],
+        "raw_products": [
+            "product_id",
+            "product_category_name",
+            "product_name_lenght",
+            "product_description_lenght",
+            "product_photos_qty",
+            "product_weight_g",
+            "product_length_cm",
+            "product_height_cm",
+            "product_width_cm"
+        ]
+    }
+
+    for table_name, columns in tables.items():
+        create_table_if_not_exists(pg_conn, table_name, columns)
+
+    logging.info("Tables staging prêtes !")
+
+
+def truncate_staging(engine):
+    """
+    Vide les tables staging avant chaque run du pipeline.
+
+    Pourquoi c'est nécessaire :
+        Sans ça, chaque run du DAG Airflow accumule les données
+        → doublons → la validation Great Expectations échoue
+        sur le test d'unicité.
+
+    ⚠️ PostgreSQL ne supporte PAS :
+        TRUNCATE TABLE IF EXISTS ...
+
+    Donc on vérifie d'abord si la table existe avant de la vider.
+    """
+
+    tables = [
+        "staging.raw_orders",
+        "staging.raw_customers",
+        "staging.raw_products"
+    ]
+
+    with engine.begin() as conn:
+        for table in tables:
+            exists = conn.execute(
+                text("SELECT to_regclass(:table_name)"),
+                {"table_name": table}
+            ).scalar()
+
+            if exists:
+                conn.execute(text(f"TRUNCATE TABLE {table}"))
+                logging.info(f"Table {table} vidée")
+            else:
+                logging.info(f"Table {table} absente — rien à vider")
+
+    logging.info("Tables staging vidées — insertion propre !")
+
+
 def insert_dataframe(pg_conn, df, table_name):
     """
     Insère un DataFrame pandas dans PostgreSQL avec psycopg2.
+
     Toutes les valeurs sont converties en string —
     pas de problème de types dans la zone staging.
-    NaN → None pour PostgreSQL NULL.
+    NaN → NULL PostgreSQL.
     """
     if df.empty:
+        logging.info(f"[{table_name}] DataFrame vide — aucune insertion")
         return
 
-    # Remplacer NaN par None → PostgreSQL NULL
     df = df.where(pd.notnull(df), None)
 
-    # Créer la table si elle n'existe pas encore
     create_table_if_not_exists(pg_conn, table_name, df.columns.tolist())
 
     columns = list(df.columns)
@@ -96,6 +178,7 @@ def insert_dataframe(pg_conn, df, table_name):
         tuple(None if v is None else str(v) for v in row)
         for row in df.to_numpy()
     ]
+
     columns_sql = ", ".join([f'"{col}"' for col in columns])
 
     query = f'''
@@ -103,89 +186,77 @@ def insert_dataframe(pg_conn, df, table_name):
         VALUES %s
     '''
 
+    logging.info(f"[{table_name}] Insertion de {len(values)} lignes")
+
     with pg_conn.cursor() as cur:
         execute_values(cur, query, values)
 
     pg_conn.commit()
 
+
 def consume_topic(topic, table_name, engine, batch_size=100):
     """
     Consomme tous les messages d'un topic Kafka et les charge
-    dans PostgreSQL par batch pour optimiser les performances.
+    dans PostgreSQL par batch.
 
-    Args:
-        topic      : nom du topic Kafka à consommer
-        table_name : nom de la table staging cible
-        engine     : connexion PostgreSQL SQLAlchemy
-        batch_size : nombre de messages à accumuler avant d'insérer
-
-    Stratégie batch :
-        On accumule batch_size messages puis on insère d'un coup.
-        Beaucoup plus rapide qu'une insertion ligne par ligne.
+    Pourquoi un group_id dynamique :
+        Kafka mémorise les offsets.
+        Avec un ID unique → relit tout le topic à chaque run.
     """
-    logging.info(f"Consumer démarré sur le topic [{topic}]...")
+    logging.info(f"Consumer démarré sur [{topic}]")
+
+    run_id = int(time.time())
 
     consumer = KafkaConsumer(
         topic,
         bootstrap_servers=os.getenv('KAFKA_BROKER', 'localhost:9092'),
-
-        # Convertit les bytes Kafka en dict Python
         value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-
-        # Lire depuis le début du topic
         auto_offset_reset='earliest',
-
-        # Valider automatiquement la position de lecture
         enable_auto_commit=True,
-
-        # Identifiant unique de ce consumer group
-        group_id=f'consumer_{topic}',
-
-        # Arrêter après 10 secondes sans nouveaux messages
+        group_id=f'consumer_{topic}_{run_id}',
         consumer_timeout_ms=10000
     )
 
-    # Connexion psycopg2 pour les insertions
     pg_conn = create_pg_connection()
-
-    # Accumulateur de messages
     batch = []
+    total_messages = 0
 
     for message in consumer:
-        data = message.value
-        batch.append(data)
+        batch.append(message.value)
+        total_messages += 1
 
-        # Quand le batch est plein → insérer dans PostgreSQL
         if len(batch) >= batch_size:
-            df = pd.DataFrame(batch)
-            insert_dataframe(pg_conn, df, table_name)
-            logging.info(f"[{table_name}] {len(batch)} lignes insérées dans staging")
+            insert_dataframe(pg_conn, pd.DataFrame(batch), table_name)
+            logging.info(f"[{table_name}] {len(batch)} lignes insérées")
             batch = []
 
-    # Insérer le dernier batch incomplet
     if batch:
-        df = pd.DataFrame(batch)
-        insert_dataframe(pg_conn, df, table_name)
-        logging.info(f"[{table_name}] {len(batch)} lignes restantes insérées")
+        insert_dataframe(pg_conn, pd.DataFrame(batch), table_name)
+        logging.info(f"[{table_name}] {len(batch)} lignes restantes")
+
+    logging.info(f"[{table_name}] Total messages lus : {total_messages}")
 
     consumer.close()
     pg_conn.close()
-    logging.info(f"[{table_name}] Terminé — données chargées dans staging !")
+    logging.info(f"[{table_name}] Terminé")
+
 
 if __name__ == "__main__":
-    # Connexion PostgreSQL
     engine = create_engine_postgres()
 
-    # Créer le schéma staging si inexistant
-    create_staging_schema(engine)
+    # Création des tables staging (les schémas sont déjà créés par init.sql)
+    pg_conn = create_pg_connection()
+    create_staging_tables(pg_conn)
+    pg_conn.close()
 
-    # Consommer les commandes → staging.raw_orders
-    consume_topic('raw_orders',    'raw_orders',    engine)
+    # Nettoyage des tables
+    truncate_staging(engine)
 
-    # Consommer les clients → staging.raw_customers
+    # Consommation des topics Kafka
+    consume_topic('raw_orders', 'raw_orders', engine)
     consume_topic('raw_customers', 'raw_customers', engine)
+    consume_topic('raw_products', 'raw_products', engine)
 
-    # Consommer les produits → staging.raw_products
-    consume_topic('raw_products',  'raw_products',  engine)
-
-    logging.info("Consumer terminé — toutes les données dans staging !")
+    logging.info("Consumer terminé — toutes les données chargées !")
+    
+    

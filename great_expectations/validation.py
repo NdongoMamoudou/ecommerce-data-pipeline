@@ -8,22 +8,22 @@
 import logging
 import os
 import pandas as pd
-from sqlalchemy import create_engine
 from dotenv import load_dotenv
 import great_expectations as ge
 
 load_dotenv()
 
-# Configuration du logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-def create_engine_postgres():
+
+def create_connection():
     """
     Crée une connexion psycopg2 directe vers PostgreSQL.
-    Compatible avec toutes les versions de pandas.
+    On utilise psycopg2 plutôt que SQLAlchemy pour éviter
+    les warnings de compatibilité avec pandas.
     """
     import psycopg2
     conn = psycopg2.connect(
@@ -35,9 +35,15 @@ def create_engine_postgres():
     )
     return conn
 
+
 def validate_orders(df):
     """
-    Valide la qualité des données de la table raw_orders.
+    Valide la qualité des données de raw_orders.
+
+    Problème connu : Kafka sérialise tout en JSON string,
+    donc les timestamps arrivent comme des strings.
+    On les convertit avant validation.
+
     Tests :
         - order_id unique et not null
         - customer_id not null
@@ -46,18 +52,21 @@ def validate_orders(df):
     """
     logging.info("Validation de raw_orders...")
 
+    # Les timestamps sont stockés comme strings à cause de Kafka
+    # On les convertit pour éviter des erreurs de type
+    df['order_purchase_timestamp'] = df['order_purchase_timestamp'].astype(str)
+
     gdf = ge.from_pandas(df)
 
-    # order_id doit être unique
+    # order_id = clé primaire → doit être unique et jamais null
     gdf.expect_column_values_to_be_unique('order_id')
-
-    # order_id ne doit pas être null
     gdf.expect_column_values_to_not_be_null('order_id')
 
-    # customer_id ne doit pas être null
+    # customer_id obligatoire — chaque commande doit avoir un client
     gdf.expect_column_values_to_not_be_null('customer_id')
 
-    # order_status doit être dans une liste précise
+    # order_status doit être dans cette liste précise
+    # toute autre valeur = donnée corrompue
     gdf.expect_column_values_to_be_in_set(
         'order_status',
         [
@@ -72,15 +81,16 @@ def validate_orders(df):
         ]
     )
 
-    # order_purchase_timestamp ne doit pas être null
+    # Date d'achat obligatoire
     gdf.expect_column_values_to_not_be_null('order_purchase_timestamp')
 
-    result = gdf.validate()
-    return result
+    return gdf.validate()
+
 
 def validate_customers(df):
     """
-    Valide la qualité des données de la table raw_customers.
+    Valide la qualité des données de raw_customers.
+
     Tests :
         - customer_id unique et not null
         - customer_state not null
@@ -90,57 +100,72 @@ def validate_customers(df):
 
     gdf = ge.from_pandas(df)
 
-    # customer_id doit être unique
+    # customer_id = clé primaire → unique et not null
     gdf.expect_column_values_to_be_unique('customer_id')
-
-    # customer_id ne doit pas être null
     gdf.expect_column_values_to_not_be_null('customer_id')
 
-    # customer_state ne doit pas être null
+    # Localisation obligatoire pour les analyses géographiques
     gdf.expect_column_values_to_not_be_null('customer_state')
-
-    # customer_city ne doit pas être null
     gdf.expect_column_values_to_not_be_null('customer_city')
 
-    result = gdf.validate()
-    return result
+    return gdf.validate()
+
 
 def validate_products(df):
     """
-    Valide la qualité des données de la table raw_products.
+    Valide la qualité des données de raw_products.
+
+    Problème connu : Kafka sérialise tout en JSON string,
+    donc les colonnes numériques arrivent comme strings.
+    Ex : product_weight_g = "225" au lieu de 225
+    → GE ne peut pas comparer "225" >= 0 (str vs int) → TypeError
+    Solution : pd.to_numeric() avant validation.
+
     Tests :
         - product_id unique et not null
         - product_weight_g entre 0 et 50000
-    Note :
-        - product_category_name peut être NULL (610 cas réels)
-          → sera corrigé par dbt avec COALESCE(..., 'unknown')
-        - product_weight_g = 0 pour 4 produits
-          → sera corrigé par dbt avec NULLIF(..., 0)
+
+    Notes sur les données Olist :
+        - product_category_name : 610 valeurs NULL → corrigé par dbt (COALESCE)
+        - product_weight_g = 0 pour 4 produits → corrigé par dbt (NULLIF)
     """
     logging.info("Validation de raw_products...")
 
+    # Convertir toutes les colonnes numériques qui arrivent comme strings
+    # errors='coerce' → les valeurs non convertibles deviennent NaN (pas d'erreur)
+    cols_numeriques = [
+        'product_weight_g',
+        'product_length_cm',
+        'product_height_cm',
+        'product_width_cm',
+        'product_name_lenght',
+        'product_description_lenght',
+        'product_photos_qty'
+    ]
+    for col in cols_numeriques:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
     gdf = ge.from_pandas(df)
 
-    # product_id doit être unique
+    # product_id = clé primaire → unique et not null
     gdf.expect_column_values_to_be_unique('product_id')
-
-    # product_id ne doit pas être null
     gdf.expect_column_values_to_not_be_null('product_id')
 
-    # product_weight_g doit être entre 0 et 50000
-    # max réel dans les données = 40425g
+    # Poids entre 0 et 50000g — max réel dans Olist = 40425g
+    # Maintenant possible car la colonne est bien numérique
     gdf.expect_column_values_to_be_between(
         'product_weight_g',
         min_value=0,
         max_value=50000
     )
 
-    result = gdf.validate()
-    return result
+    return gdf.validate()
 
-def print_results(result, table_name):
+
+def afficher_resultats(result, table_name):
     """
-    Affiche un résumé clair des résultats de validation.
+    Affiche un résumé lisible des résultats de validation.
     Retourne True si tous les tests sont passés, False sinon.
     """
     total   = result['statistics']['evaluated_expectations']
@@ -155,6 +180,7 @@ def print_results(result, table_name):
 
     if failed > 0:
         logging.error(f"{table_name} — ECHEC : {failed} test(s) échoué(s) !")
+        # Détail des tests échoués pour faciliter le débogage
         for r in result['results']:
             if not r['success']:
                 logging.error(
@@ -167,11 +193,14 @@ def print_results(result, table_name):
     logging.info(f"{'='*50}")
 
     return failed == 0
-if __name__ == "__main__":
-    # Connexion PostgreSQL via psycopg2
-    conn = create_engine_postgres()
 
-    # Charger les tables staging
+
+if __name__ == "__main__":
+
+    # Connexion PostgreSQL
+    conn = create_connection()
+
+    # Charger les 3 tables depuis le schéma staging
     logging.info("Chargement des données depuis staging...")
     df_orders    = pd.read_sql("SELECT * FROM staging.raw_orders",    conn)
     df_customers = pd.read_sql("SELECT * FROM staging.raw_customers", conn)
@@ -183,17 +212,18 @@ if __name__ == "__main__":
     logging.info(f"raw_customers : {len(df_customers)} lignes")
     logging.info(f"raw_products  : {len(df_products)} lignes")
 
-    # Valider chaque table
+    # Lancer les validations
     result_orders    = validate_orders(df_orders)
     result_customers = validate_customers(df_customers)
     result_products  = validate_products(df_products)
 
     # Afficher les résultats
-    ok_orders    = print_results(result_orders,    'raw_orders')
-    ok_customers = print_results(result_customers, 'raw_customers')
-    ok_products  = print_results(result_products,  'raw_products')
+    ok_orders    = afficher_resultats(result_orders,    'raw_orders')
+    ok_customers = afficher_resultats(result_customers, 'raw_customers')
+    ok_products  = afficher_resultats(result_products,  'raw_products')
 
-    # Résumé final
+    # Résumé final — si une validation échoue on bloque le pipeline
+    # Airflow détecte le exit(1) comme un échec de tâche
     if ok_orders and ok_customers and ok_products:
         logging.info("VALIDATION COMPLETE — toutes les données sont valides !")
         logging.info("Prêt pour la transformation dbt !")
