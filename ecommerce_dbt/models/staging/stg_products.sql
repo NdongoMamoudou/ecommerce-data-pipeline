@@ -1,15 +1,18 @@
 -- =============================================================================
 -- STG_PRODUCTS — Nettoyage des produits bruts
 -- Source  : staging.raw_products (données brutes chargées par Kafka consumer)
--- Cible   : marts.stg_products (données nettoyées)
+-- Cible   : dwh.stg_products (données nettoyées)
 -- Rôle    : nettoyer les valeurs nulles et corriger les anomalies détectées
 --           par Great Expectations :
 --           - product_category_name NULL → 'unknown'
 --           - product_weight_g = 0 → NULL
+--
+-- Note : toutes les colonnes arrivent en TEXT depuis staging
+--        car Kafka sérialise tout en string.
+--        On caste en INTEGER ici pour permettre les calculs dans fact_orders.
 -- =============================================================================
 
 WITH source AS (
-    -- Lire les données brutes depuis le schéma staging
     SELECT * FROM {{ source('staging', 'raw_products') }}
 ),
 
@@ -22,17 +25,16 @@ cleaned AS (
         -- 610 produits sans catégorie détectés par Great Expectations
         COALESCE(product_category_name, 'unknown') AS product_category_name,
 
-        -- Dimensions du produit
-        product_photos_qty,
-        product_weight_g,
+        -- Dimensions castées en INTEGER — arrivent en TEXT depuis Kafka
+        CAST(product_photos_qty    AS INTEGER) AS product_photos_qty,
+        CAST(product_weight_g      AS INTEGER) AS product_weight_g,
 
-        -- Poids — 0 remplacé par NULL
-        -- 4 produits avec poids = 0 détectés par Great Expectations
-        NULLIF(product_weight_g, 0)                AS product_weight_g_clean,
+        -- Poids — 0 remplacé par NULL après cast en INTEGER
+        NULLIF(CAST(product_weight_g AS INTEGER), 0) AS product_weight_g_clean,
 
-        product_length_cm,
-        product_height_cm,
-        product_width_cm
+        CAST(product_length_cm     AS INTEGER) AS product_length_cm,
+        CAST(product_height_cm     AS INTEGER) AS product_height_cm,
+        CAST(product_width_cm      AS INTEGER) AS product_width_cm
 
     FROM source
 

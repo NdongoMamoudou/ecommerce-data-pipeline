@@ -28,7 +28,7 @@ default_args = {
     'owner': 'mamou_ndongo',
 
     # Réessayer 3 fois si une tâche échoue
-    'retries': 3,
+    'retries': 0,
 
     # Attendre 5 minutes entre chaque tentative
     'retry_delay': timedelta(minutes=5),
@@ -96,68 +96,49 @@ def run_truncate_staging():
 
 
 def reset_kafka_topics():
-    """
-    Remet les topics Kafka à zéro avant chaque run batch.
-
-    Pourquoi c'est nécessaire :
-        Kafka conserve les messages des runs précédents.
-        Si on relit le topic depuis le début à chaque exécution,
-        on recharge aussi les anciens messages → doublons.
-
-    Stratégie :
-        1. Supprimer les topics s'ils existent
-        2. Les recréer propres et vides
-
-    Note : on utilise docker exec car Airflow est dans un container
-    et ne peut pas appeler kafka-topics directement.
-    """
-    logging.info("Réinitialisation des topics Kafka...")
-
-    topics = ["raw_orders", "raw_customers", "raw_products"]
-
-    # Supprimer les topics existants
-    for topic in topics:
-        logging.info(f"Suppression du topic : {topic}")
-        subprocess.run(
-            [
-                "docker", "exec", "etl_kafka",
-                "kafka-topics",
-                "--bootstrap-server", "localhost:9092",
-                "--delete",
-                "--topic", topic
-            ],
-            capture_output=True,
-            text=True,
-            check=False  # Ne pas lever d'erreur si le topic n'existe pas
-        )
-
-    # Attendre que Kafka supprime les topics
+    from kafka.admin import KafkaAdminClient, NewTopic
+    from kafka.errors import UnknownTopicOrPartitionError, TopicAlreadyExistsError
+    from kafka import KafkaConsumer
     import time
-    time.sleep(5)
 
-    # Recréer les topics propres
-    for topic in topics:
-        logging.info(f"Création du topic : {topic}")
-        result = subprocess.run(
-            [
-                "docker", "exec", "etl_kafka",
-                "kafka-topics",
-                "--bootstrap-server", "localhost:9092",
-                "--create",
-                "--if-not-exists",
-                "--topic", topic,
-                "--partitions", "1",
-                "--replication-factor", "1"
-            ],
-            capture_output=True,
-            text=True
-        )
+    logging.info("Réinitialisation des topics Kafka...")
+    broker = os.getenv('KAFKA_BROKER', 'kafka:9092')
+    topics = ["raw_orders", "raw_customers", "raw_products"]
+    admin = KafkaAdminClient(bootstrap_servers=broker)
 
-        if result.returncode != 0:
-            raise Exception(f"Échec création topic {topic} :\n{result.stderr}")
+    # Supprimer les topics
+    try:
+        admin.delete_topics(topics)
+        logging.info("Topics supprimés — attente 30 secondes...")
+    except UnknownTopicOrPartitionError:
+        logging.info("Topics n'existaient pas — OK")
 
-    logging.info("Topics Kafka réinitialisés avec succès !")
+    # Attendre 30 secondes — Kafka a besoin de temps pour purger
+    time.sleep(30)
 
+    # Vérifier que les topics sont bien supprimés
+    for i in range(20):
+        existing = admin.list_topics()
+        remaining = [t for t in topics if t in existing]
+        if not remaining:
+            logging.info("Topics bien supprimés !")
+            break
+        logging.info(f"Attente : {remaining} encore présents...")
+        time.sleep(5)
+
+    # Recréer les topics
+    new_topics = [
+        NewTopic(name=t, num_partitions=1, replication_factor=1)
+        for t in topics
+    ]
+    try:
+        admin.create_topics(new_topics)
+        logging.info("Topics recréés !")
+    except TopicAlreadyExistsError:
+        logging.info("Topics déjà recréés — OK")
+
+    admin.close()
+    logging.info("Topics Kafka réinitialisés !")
 
 def run_producer():
     """
