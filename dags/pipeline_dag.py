@@ -239,7 +239,7 @@ with DAG(
     start_date=datetime(2024, 1, 1),
 
     # Lancer automatiquement tous les jours à minuit
-    schedule_interval='@daily',
+    schedule_interval=None, 
 
     # Ne pas rattraper les runs passés depuis start_date
     catchup=False,
